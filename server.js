@@ -3,9 +3,9 @@ const express = require('express')
 const app = express()
 const port = 3000
 
-const initJaegerTracer = require("jaeger-client").initTracer;
+const {initTracer, ZipkinB3TextMapCodec, opentracing} = require("jaeger-client");
 
-function initTracer(serviceName) {
+function initTrace(serviceName) {
   var config = {
     serviceName: serviceName,
     sampler: {
@@ -29,13 +29,20 @@ function initTracer(serviceName) {
       },
     },
   };
-  return initJaegerTracer(config, options);
+  return initTracer(config, options);
 }
 
-const tracer = initTracer('warehouse-react');
+const tracer = initTrace('warehouse-react');
+const codec = new ZipkinB3TextMapCodec({ urlEncoding: true });
+tracer.registerInjector(opentracing.FORMAT_HTTP_HEADERS, codec);
+tracer.registerExtractor(opentracing.FORMAT_HTTP_HEADERS, codec);
 
 app.use('/api/*', (req, res, next) => {
     const span = tracer.startSpan(req.baseUrl);
+    
+    const spanCtx = {};
+    tracer.inject(span, opentracing.FORMAT_HTTP_HEADERS, spanCtx);
+    req.spanContext = spanCtx;
 
     for(let i = 0; i < req.rawHeaders.length; i += 2){
         span.setTag(`request.header.${req.rawHeaders[i]}`, req.rawHeaders[i+1]);
@@ -49,7 +56,17 @@ app.use('/api/*', (req, res, next) => {
 
     next();
 });
-app.use('/api', createProxyMiddleware({ target: process.env.WAREHOUSE_URL || 'http://localhost:3001', changeOrigin: true }));
+
+app.use('/api', createProxyMiddleware({
+  target: process.env.WAREHOUSE_URL || 'http://localhost:3001',
+  changeOrigin: true,
+  onProxyReq(proxyReq, req, res) {
+    Object.keys(req.spanContext).forEach((k) => {
+      proxyReq.setHeader(k, req.spanContext[k]);
+    });
+  }
+}));
+
 app.use(express.static('build'))
 
 app.listen(port, () => {
